@@ -1,0 +1,240 @@
+#==================================================
+# LIBRARIES
+#==================================================
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(vegan)
+library(mgcv)
+library(ggplot2)
+library(glue)
+library(patchwork)
+library(viridis)
+library(broom)
+
+#==================================================
+# 1) LOAD DATA
+#==================================================
+
+taxa <- fread("/Users/alekseisychterz/Desktop/Work/PhD/Chapter_2/taxa_lists/COI/COI_combined_taxa_aggregated.tsv")
+meta <- fread("/Users/alekseisychterz/Desktop/Work/PhD/Chapter_2/Metadata/COI_LEAP22_metadata.tsv")
+
+#==================================================
+# 2) PROCESS + AVERAGE REPLICATES
+#==================================================
+
+process_genus_data_with_reps <- function(taxa_df) {
+  
+  taxa_df <- as.data.table(taxa_df)
+  
+  tax_cols <- c("domain","supergroup","division","subdivision",
+                "class","order","family","genus","species", 
+                "kingdom", "phylum", "marker")
+  
+  sample_cols <- setdiff(colnames(taxa_df), tax_cols)
+  taxa_df <- taxa_df[, c("genus", sample_cols), with = FALSE]
+  
+  taxa_df <- taxa_df[genus != "Unknown" & !is.na(genus)]
+  taxa_df <- taxa_df[, lapply(.SD, sum), by = genus]
+  
+  taxa_mat <- as.matrix(taxa_df[, -1])
+  rownames(taxa_mat) <- taxa_df$genus
+  
+  taxa_rel <- sweep(taxa_mat, 2, colSums(taxa_mat), FUN = "/")
+  
+  sample_names <- colnames(taxa_rel)
+  base_names <- gsub("_R[0-9]+$", "", sample_names)
+  
+  taxa_rel_avg <- sapply(unique(base_names), function(bn) {
+    cols <- which(base_names == bn)
+    rowMeans(taxa_rel[, cols, drop = FALSE])
+  })
+  
+  taxa_rel_avg * 100
+}
+
+taxa_rel <- process_genus_data_with_reps(taxa)
+
+#==================================================
+# 3) HILL NUMBERS
+#==================================================
+
+calculate_hill_numbers <- function(rel_matrix) {
+  
+  prop_matrix <- rel_matrix / 100
+  
+  data.frame(
+    Sample = colnames(prop_matrix),
+    q0 = colSums(prop_matrix > 0),
+    q1 = exp(apply(prop_matrix, 2, function(x) diversity(x, "shannon"))),
+    q2 = apply(prop_matrix, 2, function(x) diversity(x, "invsimpson"))
+  )
+}
+
+hill_results <- calculate_hill_numbers(taxa_rel)
+
+#==================================================
+# 4) METADATA
+#==================================================
+
+meta_clean <- meta %>%
+  rename(
+    Sample = sample_name,
+    Movement = flow_rate,
+    NutrientP = nutrient_addition,
+    Node = upstream_downstream,
+    Mesocosm = tank,
+    Day = time
+  ) %>%
+  mutate(
+    Sample = gsub("_R[0-9]+$", "", Sample),
+    Node = factor(ifelse(Node == "Up", 1, 2)),
+    Day_num = case_when(
+      Day == "T1" ~ 0,
+      Day == "T2" ~ 28,
+      Day == "T3" ~ 49,
+      Day == "T4" ~ 73,
+      Day == "T5" ~ 91
+    )
+  ) %>%
+  distinct(Sample, .keep_all = TRUE)
+
+div <- hill_results %>%
+  left_join(meta_clean, by = "Sample") %>%
+  filter(SampleType == "sample") %>%
+  filter(Mesocosm != "H7") %>%
+  mutate(Mesocosm = factor(Mesocosm))
+
+#==================================================
+# 5) GAMM
+#==================================================
+
+model_list <- list()
+
+for (hill in c("q0", "q1", "q2")) {
+  
+  k_day <- 5
+  k <- 3
+  
+  formula_text <- glue(
+    "{hill} ~
+      Node +
+      ti(Day_num, by = Node, k = {k_day}) +
+      ti(Movement, by = Node, k = {k}) +
+      ti(NutrientP, by = Node, k = {k}) +
+      ti(Movement, Day_num, by = Node, k = c({k},{k_day})) +
+      ti(NutrientP, Day_num, by = Node, k = c({k},{k_day})) +
+      ti(Movement, NutrientP, by = Node, k = c({k},{k})) +
+      ti(Movement, NutrientP, Day_num, by = Node, k = c({k},{k},{k_day})) +
+      s(Mesocosm, bs = 're')"
+  )
+  
+  model_list[[hill]] <- gam(as.formula(formula_text), data = div, method = "REML")
+}
+
+#==================================================
+# 6) PREDICT SURFACE (MATCH THEIR LOGIC)
+#==================================================
+
+predict_surface_fixed <- function(fit, day_vals, data) {
+  
+  surface <- expand.grid(
+    Movement = seq(0, 40, by = 1),
+    NutrientP = seq(min(data$NutrientP), max(data$NutrientP), length = 100),
+    Day_num = day_vals,
+    Node = levels(data$Node)
+  )
+  
+  # Fix factor structure
+  surface$Node <- factor(surface$Node, levels = levels(data$Node))
+  
+  # Remove impossible downstream combos
+  surface <- surface %>%
+    filter(!(Node == "2" & Movement < 10))
+  
+  # Add required random effect variable
+  surface$Mesocosm <- levels(data$Mesocosm)[1]
+  surface$Mesocosm <- factor(surface$Mesocosm, levels = levels(data$Mesocosm))
+  
+  # Predict
+  surface$pred <- predict(
+    fit,
+    newdata = surface,
+    type = "response",
+    exclude = "s(Mesocosm)"
+  )
+  
+  # Label nicely
+  surface$PondPosition <- c("Upstream", "Downstream")[as.numeric(surface$Node)]
+  
+  return(surface)
+}
+
+#==================================================
+# 7) PLOT FUNCTION
+#==================================================
+
+plot_surface_fixed <- function(surface, hill) {
+  
+  ggplot(surface, aes(x = NutrientP, y = Movement, z = pred)) +
+    geom_contour_filled() +
+    geom_contour(color = "black") +
+    facet_grid(rows = vars(PondPosition), cols = vars(Day_num)) +
+    labs(
+      fill = paste("Hill", hill),
+      x = "Nutrients",
+      y = "Connectivity"
+    ) +
+    theme_bw()
+}
+
+#==================================================
+# 8) GENERATE FINAL PLOTS
+#==================================================
+
+plot_list <- list()
+
+for (hill in c("q0", "q1", "q2")) {
+  
+  surf <- predict_surface_fixed(
+    model_list[[hill]], 
+    day_vals = c(0, median(div$Day_num), max(div$Day_num)),
+    data = div
+  )
+  
+  p <- plot_surface_fixed(surf, hill)
+  
+  # Store plot
+  plot_list[[hill]] <- p
+  
+  print(p)
+}
+
+plot_list[["q1"]]
+plot_list[["q2"]]
+plot_list[["q0"]]
+
+ggsave(
+  filename = paste0("/Users/alekseisychterz/Desktop/Work/PhD/Chapter_2/figures/GAMM/COI_q0_GAMM_surface.png"),
+  plot = plot_list[["q0"]],
+  width = 8,
+  height = 5,
+  dpi = 600
+)
+
+ggsave(
+  filename = paste0("/Users/alekseisychterz/Desktop/Work/PhD/Chapter_2/figures/GAMM/COI_q1_GAMM_surface.png"),
+  plot = plot_list[["q1"]],
+  width = 8,
+  height = 5,
+  dpi = 600
+)
+
+ggsave(
+  filename = paste0("/Users/alekseisychterz/Desktop/Work/PhD/Chapter_2/figures/GAMM/COI_q2_GAMM_surface.png"),
+  plot = plot_list[["q2"]],
+  width = 8,
+  height = 5,
+  dpi = 600
+)
